@@ -1,0 +1,268 @@
+# build-zcode.yml — 构建并发布 zcode-cli（linux-x64，内置 Node，解包即用）
+#
+# 流程：
+#   1. clone 官方仓库 zai-org/ZCode（ref 可指定分支或 tag，默认 main）
+#   2. 读取上游 mise.toml，用 mise 安装锁定的 node（当前 24.14.0）与 pnpm（当前 10.33.2）
+#   3. pnpm install → build:sea:prepare → 官方 scripts/build-zcode.mjs 构建发行包
+#   4. 把 nodejs.org 官方 Node 二进制（版本取自 mise.toml）打进包内，
+#      生成可直接执行的 zcode-cli 启动器，打包为 zcode-cli-<版本>.tar.gz
+#   5. 发布到本仓库的 GitHub Release（资产仅一个 tar.gz，无安装器，
+#      用户解包后运行 ./zcode-cli 即可，无需预装 Node）
+#
+# 手动触发：Actions → Build zcode-cli → Run workflow（upstream_ref 可填 main 或 tag）
+# 重跑同名版本：会删除旧 Release 后重建（手动重跑即为替换）。
+#
+# 环境变量（按需修改）：
+#   TAG_PREFIX — Release tag 前缀，默认 v，tag 形如 v3.18.2
+#   PLATFORM   — 目标平台，固定 linux-x64（nodejs.org 的 glibc 二进制，不适用 Alpine/musl）
+
+name: Build zcode-cli
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "zai-org/ZCode 的分支或 tag（默认 main）"
+        default: "main"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-zcode-cli
+  cancel-in-progress: false
+
+env:
+  TAG_PREFIX: "v"
+  PLATFORM: "linux-x64"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 120
+    env:
+      # CLI 发行包不构建桌面端，跳过 Electron / Puppeteer 二进制下载以加速依赖安装
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PUPPETEER_SKIP_DOWNLOAD: "1"
+
+    steps:
+      # 1. clone 官方仓库 zai-org/ZCode（浅克隆）
+      - name: Checkout zai-org/ZCode
+        uses: actions/checkout@v5
+        with:
+          repository: zai-org/ZCode
+          ref: ${{ inputs.upstream_ref || 'main' }}
+          path: zcode-src
+          fetch-depth: 1
+
+      # 2. 读取上游 mise.toml，安装锁定的 node + pnpm
+      - name: Install toolchain from mise.toml (node + pnpm)
+        uses: jdx/mise-action@v2
+        with:
+          working_directory: zcode-src
+
+      - name: Install workspace dependencies
+        working-directory: zcode-src
+        run: pnpm install --frozen-lockfile
+
+      # 3a. SEA/TUI 资产前置：官方 stageTuiRuntime 要求 packages/shared/dist 已存在，
+      #     全新 clone 直接 build:zcode 会报 "Missing @zcode/shared dist files"。
+      - name: Prepare SEA/TUI prerequisites (build:sea:prepare)
+        working-directory: zcode-src
+        run: pnpm build:sea:prepare
+
+      # 3b. 解析版本与 tag（版本取自上游 package.json，node 版本取自 mise.toml）
+      - name: Resolve version / tag
+        id: meta
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          VERSION="$(jq -r .version zcode-src/package.json)"
+          NODE_VERSION="$(awk '/^\[tools\]/{t=1;next} /^\[/{t=0} t && $1=="node" && $2=="="{gsub(/"/,"",$3);print $3;exit}' zcode-src/mise.toml)"
+          if [ -z "$NODE_VERSION" ]; then
+            echo "无法从 mise.toml 读取 node 版本" >&2
+            exit 1
+          fi
+          TAG="${TAG_PREFIX}${VERSION}"
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "node_version=${NODE_VERSION}"
+            echo "upstream_ref=${UPSTREAM_REF}"
+            echo "upstream_sha=$(git -C zcode-src rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          echo "版本 ${VERSION} / tag ${TAG} / 内置 node ${NODE_VERSION} / upstream ${UPSTREAM_REF}@$(git -C zcode-src rev-parse HEAD)"
+
+      # 3c. 官方构建（CLI/TUI + server + web + 组包）
+      #     --base-url 是 build-zcode.mjs 的必填参数（用于生成 install.sh / latest.json），
+      #     本工作流不使用安装器，产物中的 install.sh 会被忽略，仅 Release 上传 tar.gz。
+      - name: Build official distribution (build-zcode.mjs)
+        working-directory: zcode-src
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          node scripts/build-zcode.mjs \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+
+      # 4. 重打包：附加内置 Node 与 zcode-cli 启动器，生成 zcode-cli-<版本>.tar.gz
+      #    解包结构：zcode-cli（可执行启动器）+ zcode/（运行时，含内置 node）
+      - name: Repack linux-x64 with bundled Node
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          NODE_VERSION: ${{ steps.meta.outputs.node_version }}
+        run: |
+          set -euo pipefail
+          DIST=zcode-src/dist/zcode
+          TARBALL_SRC="$DIST/releases/$VERSION/zcode-$VERSION.tar.gz"
+          if [ ! -f "$TARBALL_SRC" ]; then
+            echo "缺少官方发行包: $TARBALL_SRC" >&2
+            exit 1
+          fi
+
+          # 4a. 下载 nodejs.org 官方 linux-x64 二进制并校验 sha256
+          NDIR="$RUNNER_TEMP/node-dist"
+          mkdir -p "$NDIR"
+          ASSET="node-v$NODE_VERSION-linux-x64.tar.xz"
+          curl -fSL --retry 3 -o "$NDIR/$ASSET" "https://nodejs.org/dist/v$NODE_VERSION/$ASSET"
+          curl -fsSL --retry 3 -o "$NDIR/SHASUMS256.txt" "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt"
+          EXPECTED_SHA="$(awk -v f="$ASSET" '$2 == f { print $1 }' "$NDIR/SHASUMS256.txt")"
+          ACTUAL_SHA="$(sha256sum "$NDIR/$ASSET" | awk '{print $1}')"
+          if [ -z "$EXPECTED_SHA" ] || [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+            echo "node 二进制 sha256 校验失败: $ASSET（期望 $EXPECTED_SHA，实际 $ACTUAL_SHA）" >&2
+            exit 1
+          fi
+          echo "node 二进制 sha256 校验通过: $ACTUAL_SHA"
+
+          # 4b. 解包官方发行包并校验结构（与上游 runner.mjs 的运行时断言一致）
+          WORK="$RUNNER_TEMP/repack"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          tar -xzf "$TARBALL_SRC" -C "$WORK"
+          for f in zcode/bin/zcode.mjs zcode/package.json zcode/server/entry-http.js zcode/agent/zcode.cjs; do
+            if [ ! -f "$WORK/$f" ]; then
+              echo "官方发行包结构异常，缺少 $f" >&2
+              exit 1
+            fi
+          done
+
+          # 4c. 嵌入内置 Node（版本与构建工具链一致，取自 mise.toml）
+          mkdir -p "$WORK/zcode/runtime-node/$PLATFORM/bin"
+          tar -xf "$NDIR/$ASSET" -C "$WORK/zcode/runtime-node/$PLATFORM/bin" \
+            --strip-components=2 "node-v$NODE_VERSION-linux-x64/bin/node"
+          chmod 755 "$WORK/zcode/runtime-node/$PLATFORM/bin/node"
+
+          # 4d. 生成 zcode-cli 启动器（相对路径定位，任意目录解包即可运行）
+          {
+            echo '#!/usr/bin/env sh'
+            echo 'set -eu'
+            echo 'DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"'
+            echo 'NODE="$DIR/zcode/runtime-node/linux-x64/bin/node"'
+            echo 'if [ ! -x "$NODE" ]; then'
+            echo '  echo "zcode-cli: 缺少内置 Node: $NODE" >&2'
+            echo '  exit 1'
+            echo 'fi'
+            echo 'exec "$NODE" "$DIR/zcode/bin/zcode.mjs" "$@"'
+          } > "$WORK/zcode-cli"
+          chmod 755 "$WORK/zcode-cli"
+
+          # 4e. 打包（顶层两项：zcode-cli + zcode/）
+          tar -czf "$DIST/releases/$VERSION/zcode-cli-$VERSION.tar.gz" \
+            -C "$WORK" zcode-cli zcode
+          sha256sum "$DIST/releases/$VERSION/zcode-cli-$VERSION.tar.gz"
+
+      # 5a. 冒烟测试（离线）：内置 node 跑通 --version，并以 --web 模式验证 HTTP 可响应
+      - name: Smoke test (offline)
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          SMOKE="$RUNNER_TEMP/smoke"
+          rm -rf "$SMOKE"
+          mkdir -p "$SMOKE"
+          tar -xzf "zcode-src/dist/zcode/releases/$VERSION/zcode-cli-$VERSION.tar.gz" -C "$SMOKE"
+
+          GOT="$("$SMOKE/zcode-cli" --version)"
+          echo "zcode-cli --version -> $GOT"
+          if [ "$GOT" != "$VERSION" ]; then
+            echo "冒烟测试失败：--version 输出 '$GOT'，期望 '$VERSION'" >&2
+            exit 1
+          fi
+
+          # headless 环境（CI runner）没有 OS 凭据服务，按上游 server 要求提供临时密钥文件
+          SECRET_FILE="$RUNNER_TEMP/credential-secret"
+          head -c 48 /dev/urandom > "$SECRET_FILE"
+          chmod 600 "$SECRET_FILE"
+
+          LOG="$RUNNER_TEMP/web-smoke.log"
+          ZCODE_CREDENTIAL_SECRET_FILE="$SECRET_FILE" \
+            "$SMOKE/zcode-cli" --web --no-open --port 18789 > "$LOG" 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          WEB_OK=0
+          for i in $(seq 1 20); do
+            if curl -sS -o /dev/null --max-time 5 "http://127.0.0.1:18789/" 2>/dev/null; then
+              WEB_OK=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$WEB_OK" != "1" ]; then
+            echo "Web 冒烟失败，server 日志：" >&2
+            cat "$LOG" >&2
+            exit 1
+          fi
+          grep -q "ZCode Web is running" "$LOG"
+          echo "冒烟测试通过：--version 与 --web 均正常"
+
+      # 5b. 无论是否发布，上传构建产物便于排查（含官方原始 tar.gz 等中间产物）
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-cli-dist-${{ steps.meta.outputs.version }}
+          path: zcode-src/dist/zcode/
+          retention-days: 14
+
+      # 6. 发布 GitHub Release（资产仅 zcode-cli-<版本>.tar.gz；重跑同名版本先删后建）
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          NODE_VERSION: ${{ steps.meta.outputs.node_version }}
+          UPSTREAM_REF: ${{ steps.meta.outputs.upstream_ref }}
+          UPSTREAM_SHA: ${{ steps.meta.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          TARBALL="zcode-cli-$VERSION.tar.gz"
+          TARBALL_PATH="zcode-src/dist/zcode/releases/$VERSION/$TARBALL"
+          SHA="$(sha256sum "$TARBALL_PATH" | awk '{print $1}')"
+
+          NOTES="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "**zcode-cli $VERSION**（linux-x64，内置 Node \`$NODE_VERSION\`，解包即用，无需安装 Node）"
+            echo ""
+            echo "- 来源：zai-org/ZCode \`$UPSTREAM_REF\` @ \`$UPSTREAM_SHA\`"
+            echo "- sha256：\`$SHA\`"
+            echo ""
+            echo '```sh'
+            echo "tar -xzf $TARBALL"
+            echo "./zcode-cli --version"
+            echo "./zcode-cli --web    # 浏览器工作台，默认 127.0.0.1"
+            echo '```'
+          } > "$NOTES"
+
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，删除后重建（重跑 workflow 即为替换）。"
+            gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "zcode-cli $VERSION" \
+            --notes-file "$NOTES" \
+            "$TARBALL_PATH"
+          echo "Release $TAG 发布完成，资产：$TARBALL"
